@@ -13,9 +13,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"secure_c2_demo/pkg/crypto"
 	"secure_c2_demo/pkg/protocol"
+
+	"github.com/gorilla/websocket"
 )
 
 var upgrader = websocket.Upgrader{
@@ -143,17 +144,16 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, state *ServerState)
 	}
 
 	fmt.Println("----------------------------------------------------------------")
-	fmt.Println("                   🤝 HANDSHAKE VERIFICATION                   ")
-	fmt.Println("----------------------------------------------------------------")
-	fmt.Printf("[1] Handshake received from AgentID: %s\n", req.AgentID)
-	fmt.Printf("    Client Public Key (cli_pub_key): %s\n", req.ClientPubKeyHex)
-	fmt.Printf("    Client Timestamp               : %d\n", req.Timestamp)
-	fmt.Printf("    Client Signature (HMAC)        : %s\n", req.Signature)
+	fmt.Println("[HANDSHAKE 1/5] Receive HandshakeRequest")
+	fmt.Printf("    agent_id: %s\n", req.AgentID)
+	fmt.Printf("    client_pub_key_hex: %s\n", req.ClientPubKeyHex)
+	fmt.Printf("    timestamp: %d\n", req.Timestamp)
+	fmt.Printf("    signature: %s\n", req.Signature)
 
 	// Step 1.1: Replay attack check (Timestamp freshness +/- 60 seconds)
 	now := time.Now().Unix()
 	if math.Abs(float64(now-req.Timestamp)) > 60 {
-		fmt.Printf("\n[!] 🚨 SECURITY REJECTION: Replay attack detected! Timestamp delta too large (%d sec)\n", now-req.Timestamp)
+		fmt.Printf("\n[HANDSHAKE 2/5] REJECTED: timestamp is too old (%d sec difference)\n", now-req.Timestamp)
 		sendHandshakeResponse(conn, "REJECTED", "Expired timestamp / replay attack detected")
 		return
 	}
@@ -161,7 +161,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, state *ServerState)
 	// Step 1.2: Identity check in DB
 	agentSecret, exists := AuthorizedAgents[req.AgentID]
 	if !exists {
-		fmt.Printf("\n[!] 🚨 SECURITY REJECTION: Unknown Agent ID '%s'. Not registered in database!\n", req.AgentID)
+		fmt.Printf("\n[HANDSHAKE 2/5] REJECTED: agent_id is not enrolled (%s)\n", req.AgentID)
 		sendHandshakeResponse(conn, "REJECTED", "Agent ID not enrolled")
 		return
 	}
@@ -170,13 +170,12 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, state *ServerState)
 	hmacData := req.AgentID + req.ClientPubKeyHex + strconv.FormatInt(req.Timestamp, 10)
 	isValid := crypto.VerifyHMAC([]byte(agentSecret), []byte(hmacData), req.Signature)
 	if !isValid {
-		fmt.Println("\n[!] 🚨 SECURITY ALERT: HMAC SIGNATURE MISMATCH!")
-		fmt.Println("    Someone is trying to spoof Agent ID or injected a fake Public Key!")
-		fmt.Println("    Connection is terminated immediately.")
+		fmt.Println("\n[HANDSHAKE 2/5] REJECTED: HMAC signature mismatch")
+		fmt.Println("    agent identity or public key may have been spoofed")
 		sendHandshakeResponse(conn, "REJECTED", "Invalid HMAC signature. Rogue Agent blocked!")
 		return
 	}
-	fmt.Println("\n[✓] [2] HMAC Verification: PASSED (Authentic Agent Identity Confirmed)")
+	fmt.Println("[HANDSHAKE 2/5] HMAC verified: agent identity accepted")
 
 	// ==========================================================
 	// STEP 2: Compute Shared Secret (ECDH X25519)
@@ -200,10 +199,9 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, state *ServerState)
 		return
 	}
 
-	sskFingerprint := crypto.Fingerprint(ssk)
-	fmt.Printf("[✓] [3] ECDH Shared Secret (SSK) Computed!\n")
-	fmt.Printf("    Formula: ECDH(ser_pri_key, cli_pub_key)\n")
-	fmt.Printf("    🔑 SSK Fingerprint (SHA-256)   : %s\n", sskFingerprint)
+	fmt.Printf("[HANDSHAKE 3/5] Compute Raw SSK with X25519 ECDH\n")
+	fmt.Printf("    ECDH input: server_private_key + client_public_key\n")
+	fmt.Printf("    Raw SSK                         : %x (%d bytes)\n", ssk, len(ssk))
 
 	// Derive AES-256 Session Key via HKDF
 	sessionKey, err := crypto.DeriveKey(ssk, nil, "c2-secure-session-v1", 32)
@@ -211,17 +209,20 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, state *ServerState)
 		fmt.Printf("[!] HKDF key derivation failed: %v\n", err)
 		return
 	}
-	sessionKeyFingerprint := crypto.Fingerprint(sessionKey)
-	fmt.Printf("[✓] [4] Derived Session Key via HKDF-SHA256!\n")
-	fmt.Printf("    🛡️ Session Key Fingerprint     : %s\n", sessionKeyFingerprint)
+	fmt.Printf("[HANDSHAKE 4/5] Derive Raw Session Key with HKDF-SHA256\n")
+	fmt.Printf("    HKDF input (Raw SSK)            : %x\n", ssk)
+	fmt.Printf("    HKDF hash                      : SHA-256\n")
+	fmt.Printf("    HKDF salt                      : nil\n")
+	fmt.Printf("    HKDF info                      : %q\n", "c2-secure-session-v1")
+	fmt.Printf("    HKDF output length             : %d bytes\n", len(sessionKey))
+	fmt.Printf("    Raw Session Key                : %x (%d bytes)\n", sessionKey, len(sessionKey))
 
 	// Send handshake confirmation
 	if err := sendHandshakeResponse(conn, "SUCCESS", "Handshake authenticated and key derived successfully"); err != nil {
 		return
 	}
+	fmt.Println("[HANDSHAKE 5/5] Session key ready; send SUCCESS to agent")
 	fmt.Println("----------------------------------------------------------------")
-	fmt.Println("    🎉 SECURE ENCRYPTED SESSION ESTABLISHED WITH AGENT!        ")
-	fmt.Println("----------------------------------------------------------------\n")
 
 	// ==========================================================
 	// STEP 3: Encrypted Communication Loop
@@ -244,9 +245,25 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, state *ServerState)
 				continue
 			}
 
-			// Decrypt ciphertext using sessionKey
-			decryptedBytes, err := crypto.DecryptHex(sessionKey, envelope.PayloadHex)
+			isFirstResponse := envelope.Sequence == 1
+			if isFirstResponse {
+				fmt.Printf("\n[TRACE][SERVER RECEIVE] type=%s sequence=%d payload_hex_chars=%d\n", envelope.Type, envelope.Sequence, len(envelope.PayloadHex))
+			}
+			wirePayload, err := hex.DecodeString(envelope.PayloadHex)
 			if err != nil {
+				fmt.Printf("    hex decode failed: %v\n", err)
+				continue
+			}
+			if isFirstResponse {
+				fmt.Printf("    payload bytes decoded from wire: %d\n", len(wirePayload))
+			}
+
+			// Decrypt the actual received payload using AES-GCM.
+			decryptedBytes, trace, err := crypto.DecryptDetailed(sessionKey, wirePayload)
+			if err != nil {
+				if envelope.Sequence == 1 {
+					printDecryptTrace("SERVER RESPONSE", trace, err)
+				}
 				fmt.Printf("[!] 🚨 DECRYPTION FAILED for sequence %d: %v\n", envelope.Sequence, err)
 				continue
 			}
@@ -256,9 +273,14 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, state *ServerState)
 				fmt.Printf("[!] Decrypted payload is not JSON: %s\n", string(decryptedBytes))
 				continue
 			}
+			if resp.CommandID == "CMD-101" {
+				printDecryptTrace("SERVER RESPONSE", trace, nil)
+			}
 
 			fmt.Println("\n📥 [RECV FROM AGENT]")
-			fmt.Printf("    [🔒 Wire Ciphertext] : %s... (length: %d chars)\n", envelope.PayloadHex[:32], len(envelope.PayloadHex))
+			if resp.CommandID == "CMD-101" {
+				fmt.Printf("    [🔒 Wire Ciphertext] : %s (length: %d chars)\n", envelope.PayloadHex, len(envelope.PayloadHex))
+			}
 			fmt.Printf("    [🔓 Decrypted Plain] : Status=%s, CmdID=%s\n", resp.Status, resp.CommandID)
 			fmt.Printf("    [📄 Output]           : %s\n", resp.Output)
 		}
@@ -291,10 +313,15 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, state *ServerState)
 		time.Sleep(3 * time.Second)
 
 		cmdJSON, _ := json.Marshal(cmd)
-		encHex, err := crypto.EncryptHex(sessionKey, cmdJSON)
+		encPayload, trace, err := crypto.EncryptDetailed(sessionKey, cmdJSON)
 		if err != nil {
 			log.Printf("[!] Failed to encrypt command: %v", err)
 			continue
+		}
+		encHex := hex.EncodeToString(encPayload)
+		isFirstVirusCommand := cmd.Action == "SCAN_VIRUS"
+		if isFirstVirusCommand {
+			printEncryptTrace("SERVER COMMAND", trace)
 		}
 
 		sequenceCounter++
@@ -317,7 +344,9 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, state *ServerState)
 
 		fmt.Println("\n📤 [SENT TO AGENT]")
 		fmt.Printf("    [🔓 Action Planned]  : %s (ID: %s)\n", cmd.Action, cmd.CommandID)
-		fmt.Printf("    [🔒 Sent on Wire]   : %s... (encrypted AES-256-GCM)\n", encHex[:32])
+		if isFirstVirusCommand {
+			fmt.Printf("    [🔒 Sent on Wire]   : %s (encrypted AES-256-GCM)\n", encHex)
+		}
 	}
 
 	// Keep alive
@@ -333,4 +362,49 @@ func sendHandshakeResponse(conn *websocket.Conn, status string, message string) 
 	}
 	bytes, _ := json.Marshal(resp)
 	return conn.WriteMessage(websocket.TextMessage, bytes)
+}
+
+func printEncryptTrace(label string, trace *crypto.AESGCMTrace) {
+	fmt.Printf("\n[TRACE][%s ENCRYPT] AES-256-GCM\n", label)
+	fmt.Printf("  1) INPUT\n     plaintext: %q (%d bytes)\n     raw session key: %x (%d bytes)\n", trace.Plaintext, len(trace.Plaintext), trace.Key, len(trace.Key))
+	fmt.Printf("  2) GCM OUTPUT\n")
+	fmt.Printf("     ciphertext = AES-256-GCM(plaintext, raw session key, nonce)\n")
+	fmt.Printf("     auth tag   = GCM-Tag(raw session key, nonce, ciphertext, AAD=nil)\n")
+	fmt.Printf("     nonce: %x (%d bytes)\n     ciphertext: %x (%d bytes)\n     auth tag: %x (%d bytes)\n", trace.Nonce, len(trace.Nonce), trace.Ciphertext, len(trace.Ciphertext), trace.AuthTag, len(trace.AuthTag))
+	fmt.Printf("  3) PAYLOAD\n     nonce || ciphertext || auth tag\n     total: %d bytes\n", len(trace.Payload))
+	fmt.Printf("  4) WIRE\n     payload_hex: %s (%d chars)\n", hex.EncodeToString(trace.Payload), len(trace.Payload)*2)
+	printPayloadLayout(trace)
+}
+
+func printDecryptTrace(label string, trace *crypto.AESGCMTrace, decryptErr error) {
+	if trace == nil {
+		return
+	}
+	fmt.Printf("\n[TRACE][%s DECRYPT] AES-256-GCM\n", label)
+	fmt.Printf("  1) RECEIVE\n     payload_hex -> hex.DecodeString -> %d payload bytes\n", len(trace.Payload))
+	fmt.Printf("  2) SPLIT\n     nonce: bytes[0:%d] = %x\n     ciphertext: bytes[%d:%d] = %x\n     auth tag: bytes[%d:%d] = %x\n", len(trace.Nonce), trace.Nonce, len(trace.Nonce), len(trace.Nonce)+len(trace.Ciphertext), trace.Ciphertext, len(trace.Nonce)+len(trace.Ciphertext), len(trace.Payload), trace.AuthTag)
+	fmt.Printf("  3) VERIFY + DECRYPT\n     raw session key: %x (%d bytes)\n", trace.Key, len(trace.Key))
+	if decryptErr != nil {
+		fmt.Printf("     authentication: FAILED (%v)\n", decryptErr)
+		return
+	}
+	fmt.Printf("     authentication: PASSED\n")
+	fmt.Printf("  4) RESULT\n     plaintext: %q (%d bytes)\n", trace.Plaintext, len(trace.Plaintext))
+	printPayloadLayout(trace)
+}
+
+func printPayloadLayout(trace *crypto.AESGCMTrace) {
+	nonceStart := 0
+	nonceEnd := len(trace.Nonce)
+	ciphertextStart := nonceEnd
+	ciphertextEnd := ciphertextStart + len(trace.Ciphertext)
+	authTagStart := ciphertextEnd
+	authTagEnd := authTagStart + len(trace.AuthTag)
+
+	fmt.Printf("    [PAYLOAD LAYOUT] total=%d bytes / %d hex chars\n", len(trace.Payload), len(trace.Payload)*2)
+	fmt.Printf("        nonce      bytes[%d:%d]   = %x (%d bytes / %d hex chars)\n", nonceStart, nonceEnd, trace.Nonce, len(trace.Nonce), len(trace.Nonce)*2)
+	fmt.Printf("        ciphertext bytes[%d:%d] = %x (%d bytes / %d hex chars)\n", ciphertextStart, ciphertextEnd, trace.Ciphertext, len(trace.Ciphertext), len(trace.Ciphertext)*2)
+	fmt.Printf("        auth tag   bytes[%d:%d] = %x (%d bytes / %d hex chars)\n", authTagStart, authTagEnd, trace.AuthTag, len(trace.AuthTag), len(trace.AuthTag)*2)
+	fmt.Printf("        assembly   = nonce || ciphertext || auth tag\n")
+	fmt.Printf("        hex view   = %s | %s | %s\n", hex.EncodeToString(trace.Nonce), hex.EncodeToString(trace.Ciphertext), hex.EncodeToString(trace.AuthTag))
 }

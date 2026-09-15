@@ -98,3 +98,46 @@ func TestHMACAuthentication(t *testing.T) {
 
 	t.Logf("✓ HMAC Authentication & Tamper-resistance verified!")
 }
+
+func TestAESGCMDetailedTraceAndTamperDetection(t *testing.T) {
+	key := []byte("01234567890123456789012345678901")
+	plaintext := []byte(`{"action":"SCAN_VIRUS","target":"C:\\"}`)
+
+	payload, encryptTrace, err := crypto.EncryptDetailed(key, plaintext)
+	if err != nil {
+		t.Fatalf("Detailed encryption failed: %v", err)
+	}
+
+	if len(encryptTrace.Key) != 32 {
+		t.Fatalf("AES-256 key length = %d, want 32", len(encryptTrace.Key))
+	}
+	if len(encryptTrace.Nonce) != 12 {
+		t.Fatalf("GCM nonce length = %d, want 12", len(encryptTrace.Nonce))
+	}
+	if len(encryptTrace.AuthTag) != 16 {
+		t.Fatalf("GCM authentication tag length = %d, want 16", len(encryptTrace.AuthTag))
+	}
+	if !bytes.Equal(payload, encryptTrace.Payload) {
+		t.Fatal("trace payload does not match returned wire payload")
+	}
+	if len(payload) != 12+len(plaintext)+16 {
+		t.Fatalf("wire payload length = %d, want %d", len(payload), 12+len(plaintext)+16)
+	}
+
+	decrypted, decryptTrace, err := crypto.DecryptDetailed(key, payload)
+	if err != nil {
+		t.Fatalf("Detailed decryption failed: %v", err)
+	}
+	if !bytes.Equal(decrypted, plaintext) {
+		t.Fatalf("decrypted plaintext = %q, want %q", decrypted, plaintext)
+	}
+	if !bytes.Equal(decryptTrace.Nonce, encryptTrace.Nonce) {
+		t.Fatal("decryption trace nonce differs from encryption trace nonce")
+	}
+
+	tampered := append([]byte(nil), payload...)
+	tampered[len(tampered)-1] ^= 0x01
+	if _, _, err := crypto.DecryptDetailed(key, tampered); err == nil {
+		t.Fatal("tampered authentication tag was accepted")
+	}
+}

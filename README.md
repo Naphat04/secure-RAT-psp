@@ -53,8 +53,8 @@ go run ./cmd/agent
 ```
 
 #### 🔍 จุดที่ให้สังเกตและชี้ให้อาจารย์ดู:
-1. **คีย์ลับ SSK ตรงกันเป๊ะ:** ดูค่า `🔑 SSK Fingerprint (SHA-256)` ในทั้งสองหน้าจอ จะเห็นว่าเป็นเลขเดียวกัน 64 ตัวอักษร ทั้งๆ ที่ Server ใช้ `ser_pri + cli_pub` และ Agent ใช้ `cli_pri + ser_pub`
-2. **การสกัด Session Key:** ทั้งคู่รันผ่าน `HKDF-SHA256` ได้ `🛡️ Session Key Fingerprint` ตรงกัน
+1. **คีย์ลับ SSK ตรงกันเป๊ะ:** ดูค่า `Raw SSK` ในทั้งสองหน้าจอ ทั้งสองฝั่งจะคำนวณได้ค่าเดียวกัน แม้ Server ใช้ `ser_pri + cli_pub` และ Agent ใช้ `cli_pri + ser_pub`
+2. **การสกัด Session Key:** ดูขั้นตอน `HKDF-SHA256` และค่า `Raw Session Key` ที่ได้เหมือนกันทั้งสองฝั่ง
 3. **ข้อความที่ส่งผ่านสายสัญญาณถูกเข้ารหัส:** ดูบรรทัด `[🔒 Wire Ciphertext]` จะเห็นว่าเป็นเลขสุ่มฐาน 16 (Hex) ที่คนดักฟังไม่มีทางอ่านออก แต่ทั้งสองฝั่งสามารถถอดรหัสออกมาเป็น `[🔓 Decrypted Plain]` ได้อย่างถูกต้อง
 
 ---
@@ -194,25 +194,29 @@ go run ./cmd/agent -rogue
 ```text
 [✓] [3] ECDH Shared Secret (SSK) Computed!
     Formula: ECDH(ser_pri_key, cli_pub_key)
-    🔑 SSK Fingerprint (SHA-256)   : 9468d4cbb8c083c4342d5956a4814430fc4ea0f46c22f2d49a5c9d3a988c8c0f
+    Raw SSK                         : <32-byte raw SSK>
 ```
 **หน้าจอ Agent แสดง:**
 ```text
 [✓] [4] ECDH Shared Secret (SSK) Computed on Agent!
     Formula: ECDH(cli_pri_key, ser_pub_key)
-    🔑 SSK Fingerprint (SHA-256)   : 9468d4cbb8c083c4342d5956a4814430fc4ea0f46c22f2d49a5c9d3a988c8c0f
+    Raw SSK                         : <same 32-byte raw SSK>
 ```
 
 🔗 **จุด Interactive มหัศจรรย์ทางคณิตศาสตร์:**
-* สังเกตที่บรรทัด **`🔑 SSK Fingerprint`**: ทั้งหน้าจอ Server และ Agent ขึ้นเลขเดียวกันคือ:
-  `9468d4cbb8c083c4342d5956a4814430fc4ea0f46c22f2d49a5c9d3a988c8c0f`
+* สังเกตที่บรรทัด **`Raw SSK`**: ทั้งหน้าจอ Server และ Agent ขึ้นค่าเดียวกัน แม้จะคำนวณจาก private/public key คนละฝั่ง
 * **ทำไมถึงมหัศจรรย์?** เพราะแม่ใช้ `กุญแจลับแม่ + กุญแจสาธารณะลูก` ส่วนลูกใช้ `กุญแจลับลูก + กุญแจสาธารณะแม่` แต่ปลายทางได้เลขเดียวกันเป๊ะ **โดยที่ทั้งคู่ไม่เคยส่งเลข `9468d4...` ข้ามสายสัญญาณหากันเลย!** คนดักฟังต่อให้ดักฟังสัญญาณได้ 100% ก็ไม่มีวันรู้เลขนี้!
 
 #### ขั้นที่ 2.4: แตกเป็น Session Key สำหรับเข้ารหัส AES
 **ทั้งสองหน้าจอแสดง:**
 ```text
 [✓] Derived Session Key via HKDF-SHA256!
-    🛡️ Session Key Fingerprint     : 4d97a32405c83761346ed3eb350870695efbb917f7a56fa695b61351330fb083
+    HKDF input (Raw SSK)            : <same 32-byte raw SSK>
+    HKDF hash                      : SHA-256
+    HKDF salt                      : nil
+    HKDF info                      : "c2-secure-session-v1"
+    HKDF output length             : 32 bytes
+    Raw Session Key                : <32-byte raw session key>
 ```
 * **ภาษาคน:** ทั้งคู่เอารหัสตู้เซฟไปผ่านเครื่องสกัด (HKDF) เพื่อทำเป็นลูกกุญแจความยาว 32 bytes (256 บิต) ได้กุญแจรหัส `4d97a3...` ตรงกันทั้งสองฝั่ง พร้อมใช้ล็อกกล่องข้อความแล้ว
 
@@ -257,6 +261,106 @@ go run ./cmd/agent -rogue
 *(คำสั่งต่อไปอย่าง `GET_PROCESSES` และ `SYSTEM_INFO` ก็จะทำงานแบบเข้ารหัสสองทางแบบนี้ทุกๆ 3 วินาทีสม่ำเสมอ)*
 
 ---
+
+### 🔍 Ciphertext และ Auth Tag สร้างมาจากอะไร
+
+ในการส่ง `SCAN_VIRUS` จริง Server ไม่ได้เอา ciphertext หรือ auth tag มาจากค่าที่พิมพ์ใน log แต่เกิดจากการเรียก AES-GCM จริงตามลำดับนี้:
+
+```text
+plaintext JSON
+Raw Session Key
+random nonce
+                |
+                | cipher.NewGCM(AES-256)
+                | gcm.Seal(nil, nonce, plaintext, nil)
+                v
+sealed = ciphertext || auth tag
+```
+
+ความหมายของผลลัพธ์:
+
+```text
+Ciphertext
+    = ส่วนข้อมูล plaintext ที่ถูกเข้ารหัสด้วย AES-256
+        โดยใช้ Raw Session Key และ nonce
+
+Auth Tag
+    = tag ที่ GCM สร้างเพื่อยืนยันว่า key, nonce,
+        ciphertext และ AAD ไม่ถูกแก้ไข
+    = ใน demo นี้ AAD เป็น nil
+
+สรุปแบบดูจาก input/output:
+
+```text
+Ciphertext = AES-256-GCM.Encrypt(
+    plaintext,
+    Raw Session Key,
+    random nonce,
+)
+
+Auth Tag = GCM-Tag(
+    Raw Session Key,
+    random nonce,
+    ciphertext,
+    AAD = nil,
+)
+```
+
+ดังนั้น `ciphertext` ไม่ได้เกิดจาก plaintext อย่างเดียว และ `auth tag` ไม่ใช่ ciphertext อีกชุดหนึ่ง แต่ทั้งคู่ถูกสร้างจาก operation เดียวกันของ AES-GCM โดยใช้ key และ nonce เดียวกัน
+```
+
+จากนั้นโปรแกรมประกอบข้อมูลที่จะส่งจริง:
+
+```text
+payload bytes = nonce || ciphertext || auth tag
+payload_hex   = HEX(payload bytes)
+```
+
+แล้วจึงใส่ `payload_hex` ลงใน `EncryptedEnvelope` และส่งผ่าน WebSocket:
+
+```text
+{
+    "type": "COMMAND",
+    "sequence": 1,
+    "payload_hex": "HEX(nonce || ciphertext || auth tag)"
+}
+```
+
+ฝั่ง Agent ใช้ `hex.DecodeString` แปลง `payload_hex` กลับเป็น bytes แยกเป็น nonce, ciphertext และ auth tag แล้วเรียก:
+
+```text
+gcm.Open(nil, nonce, ciphertext || auth tag, nil)
+```
+
+ถ้า Auth Tag ไม่ถูกต้อง `gcm.Open` จะคืน error และไม่คืน plaintext ให้ใช้งาน
+
+ขั้นตอนเดียวกันนี้เกิดในทิศทาง Agent ส่ง response กลับ Server ด้วย เพียงเปลี่ยน plaintext จาก command เป็น response JSON
+
+## 🔬 รายละเอียด AES-GCM ที่แสดงจริงใน Terminal
+
+หลังจาก handshake สำเร็จ โปรแกรมจะแสดง trace จากการทำงานของ AES-GCM จริงทั้งสองทิศทาง ไม่ใช่ข้อมูลจำลอง โดยรูปแบบข้อมูลบนสายยังคงเป็น:
+
+```text
+[12-byte random nonce][ciphertext][16-byte authentication tag]
+```
+
+ลำดับฝั่งส่งคือ:
+
+1. แปลง command หรือ response เป็น plaintext JSON
+2. สุ่ม nonce ใหม่ด้วย `crypto/rand.Reader`
+3. เรียก `cipher.NewGCM(...).Seal(...)` เพื่อสร้าง ciphertext และ authentication tag
+4. รวม nonce + ciphertext + tag แล้วแปลงเป็น hex
+5. ใส่ลง `EncryptedEnvelope` และส่งผ่าน WebSocket
+
+ลำดับฝั่งรับคือ:
+
+1. แปลง payload hex กลับเป็น bytes
+2. แยก nonce, ciphertext และ authentication tag จาก payload ที่รับจริง
+3. เรียก `gcm.Open(...)` เพื่อตรวจ authentication tag และถอดรหัส
+4. ถ้า tag ไม่ถูกต้อง การถอดรหัสจะล้มเหลว
+5. แปลง plaintext JSON กลับเป็น command หรือ response
+
+Trace จะแสดงค่า key, nonce, ciphertext, tag, payload และ plaintext เพื่อใช้สาธิตเท่านั้น การแสดงค่าเหล่านี้ทำให้ผู้ที่มี terminal log สามารถถอดรหัสข้อมูลที่บันทึกไว้ได้ จึงห้ามใช้ logging รูปแบบนี้ใน production
 
 ### 🦹‍♂️ ฉากที่ 4: สาธิตกรณีแฮกเกอร์พยายามปลอมตัว (Rogue Agent Simulation)
 
