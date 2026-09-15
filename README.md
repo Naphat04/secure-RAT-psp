@@ -262,79 +262,96 @@ go run ./cmd/agent -rogue
 
 ---
 
-### 🔍 Ciphertext และ Auth Tag สร้างมาจากอะไร
+### 🔍 ขั้นตอนเข้ารหัสและถอดรหัส Plaintext จริง
 
-ในการส่ง `SCAN_VIRUS` จริง Server ไม่ได้เอา ciphertext หรือ auth tag มาจากค่าที่พิมพ์ใน log แต่เกิดจากการเรียก AES-GCM จริงตามลำดับนี้:
+#### 1. Server: เข้ารหัส Plaintext เป็น Payload
+
+เมื่อ Server เตรียม command เช่น `SCAN_VIRUS` จะได้ plaintext JSON ก่อน:
 
 ```text
 plaintext JSON
-Raw Session Key
-random nonce
-                |
-                | cipher.NewGCM(AES-256)
-                | gcm.Seal(nil, nonce, plaintext, nil)
-                v
+    |
+    | json.Marshal -> plaintext bytes
+    v
+Raw Session Key + random nonce + plaintext bytes
+    |
+    | cipher.NewGCM(AES-256)
+    | gcm.Seal(nil, nonce, plaintext, nil)
+    v
 sealed = ciphertext || auth tag
 ```
 
 ความหมายของผลลัพธ์:
 
 ```text
-Ciphertext
-    = ส่วนข้อมูล plaintext ที่ถูกเข้ารหัสด้วย AES-256
-        โดยใช้ Raw Session Key และ nonce
+ciphertext = AES-256-GCM.Encrypt(plaintext, Raw Session Key, nonce)
 
-Auth Tag
-    = tag ที่ GCM สร้างเพื่อยืนยันว่า key, nonce,
-        ciphertext และ AAD ไม่ถูกแก้ไข
-    = ใน demo นี้ AAD เป็น nil
-
-สรุปแบบดูจาก input/output:
-
-```text
-Ciphertext = AES-256-GCM.Encrypt(
-    plaintext,
+auth tag = GCM-Tag(
     Raw Session Key,
-    random nonce,
-)
-
-Auth Tag = GCM-Tag(
-    Raw Session Key,
-    random nonce,
+    nonce,
     ciphertext,
     AAD = nil,
 )
 ```
 
-ดังนั้น `ciphertext` ไม่ได้เกิดจาก plaintext อย่างเดียว และ `auth tag` ไม่ใช่ ciphertext อีกชุดหนึ่ง แต่ทั้งคู่ถูกสร้างจาก operation เดียวกันของ AES-GCM โดยใช้ key และ nonce เดียวกัน
-```
+`ciphertext` และ `auth tag` เกิดจาก AES-GCM operation เดียวกัน โดยใช้ Raw Session Key และ nonce เดียวกัน แต่มีหน้าที่ต่างกัน: ciphertext ซ่อนเนื้อหา ส่วน auth tag ใช้ตรวจว่าข้อมูลถูกแก้ไขหรือไม่
 
-จากนั้นโปรแกรมประกอบข้อมูลที่จะส่งจริง:
+#### 2. Server: ประกอบข้อมูลที่จะส่ง
+
+โปรแกรมรวมค่าจริงตามลำดับนี้:
 
 ```text
 payload bytes = nonce || ciphertext || auth tag
 payload_hex   = HEX(payload bytes)
 ```
 
-แล้วจึงใส่ `payload_hex` ลงใน `EncryptedEnvelope` และส่งผ่าน WebSocket:
+แล้วใส่ลงใน `EncryptedEnvelope`:
 
-```text
+```json
 {
-    "type": "COMMAND",
-    "sequence": 1,
-    "payload_hex": "HEX(nonce || ciphertext || auth tag)"
+  "type": "COMMAND",
+  "sequence": 1,
+  "payload_hex": "HEX(nonce || ciphertext || auth tag)"
 }
 ```
 
-ฝั่ง Agent ใช้ `hex.DecodeString` แปลง `payload_hex` กลับเป็น bytes แยกเป็น nonce, ciphertext และ auth tag แล้วเรียก:
+`payload_hex` เป็นเพียงการแปลง binary payload เป็นตัวอักษร hex เพื่อส่งใน JSON ไม่ใช่การเข้ารหัสเพิ่มอีกชั้น
+
+#### 3. Agent: แกะ Payload กลับเป็น Plaintext
+
+Agent รับ envelope จาก WebSocket แล้วทำตามลำดับนี้:
 
 ```text
-gcm.Open(nil, nonce, ciphertext || auth tag, nil)
+EncryptedEnvelope.payload_hex
+    |
+    | hex.DecodeString
+    v
+payload bytes
+    |
+    | payload[0:12]       -> nonce
+    | payload[12:N-16]    -> ciphertext
+    | payload[N-16:N]     -> auth tag
+    v
+nonce + ciphertext + auth tag
+    |
+    | gcm.Open(nil, nonce, ciphertext || auth tag, nil)
+    v
+plaintext JSON bytes
+    |
+    | json.Unmarshal
+    v
+CommandPayload
 ```
 
-ถ้า Auth Tag ไม่ถูกต้อง `gcm.Open` จะคืน error และไม่คืน plaintext ให้ใช้งาน
+ในโค้ด Agent การเรียก `gcm.Open` จะใช้ Raw Session Key ที่ Agent สร้างจาก handshake, nonce ที่อ่านจาก payload และ `ciphertext || auth tag` ที่แยกได้:
 
-ขั้นตอนเดียวกันนี้เกิดในทิศทาง Agent ส่ง response กลับ Server ด้วย เพียงเปลี่ยน plaintext จาก command เป็น response JSON
+```go
+plaintext, err := gcm.Open(nil, nonce, ciphertextAndTag, nil)
+```
+
+ถ้า key, nonce, ciphertext หรือ auth tag ไม่ถูกต้อง `gcm.Open` จะคืน error และไม่คืน plaintext ให้ใช้งาน หลังจากถอดสำเร็จจึงค่อย `json.Unmarshal` เพื่ออ่าน `command_id`, `action` และ `parameters`
+
+ขั้นตอนเดียวกันนี้เกิดตอน Agent ส่ง response กลับ Server โดยเปลี่ยน plaintext จาก command JSON เป็น response JSON
 
 ## 🔬 รายละเอียด AES-GCM ที่แสดงจริงใน Terminal
 
